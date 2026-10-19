@@ -260,3 +260,7 @@ input[type=search] { background: var(--panel); margin-bottom: 4px; }
 .row.static { cursor: default; }
 .need { display: flex; align-items: center; gap: 3px; flex: none; color: var(--muted); font-size: 11px; }
 .need input { accent-color: var(--gold); }
+.presets { margin: 4px 0 0; }
+.align { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: -4px 0 10px; }
+.align input { padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); color: var(--text); min-width: 0; }
+.align .secondary { padding: 10px 12px; font-size: 13px; }

@@ -236,7 +236,14 @@ async function saveMove() {
   await db.put('moves', m);
   sheet.close();
   if (!old) month = m.date.slice(0, 7);
-  toast(`${m.type === 'out' ? 'Spesa' : 'Entrata'} salvata: ${eur(amount)} · ${catOf(m.cat).name}`);
+  // Svuotatasche: una spesa nuova arrotondata all'euro, la differenza va nel salvadanaio.
+  const pocket = goals.find(g => g.roundUp);
+  const change = Math.round((Math.ceil(amount) - amount) * 100) / 100;
+  if (!old && pocket && m.type === 'out' && change > 0) {
+    deposits.push({ id: Date.now() + 1, goalId: pocket.id, date: m.date, amount: change, auto: true, note: 'Arrotondamento' });
+    await saveDeposits();
+  }
+  toast(`${m.type === 'out' ? 'Spesa' : 'Entrata'} salvata: ${eur(amount)} · ${catOf(m.cat).name}${!old && pocket && m.type === 'out' && change > 0 ? ` · 🪙 +${eur(change)} nello ${pocket.name}` : ''}`);
   budgetToast(m);
   route();
 }
@@ -425,7 +432,8 @@ let deposits = [];
 const saveGoals = () => setSetting('goals', goals);
 const saveDeposits = () => setSetting('deposits', deposits);
 const goalSaved = g => deposits.filter(d => d.goalId === g.id).reduce((a, d) => a + d.amount, 0);
-const savedInMonth = ym => deposits.filter(d => d.date.startsWith(ym)).reduce((a, d) => a + d.amount, 0);
+// Saldi iniziali e allineamenti con la banca non sono risparmi nuovi
+const savedInMonth = ym => deposits.filter(d => d.date.startsWith(ym) && !d.adjust).reduce((a, d) => a + d.amount, 0);
 
 // Necessità (la parte "50" della regola): le altre spese contano come desideri. Si cambia in Categorie.
 const NEED_IDS = new Set(['spesa', 'casa', 'bollette', 'auto', 'trasporti', 'salute', 'animali']);
@@ -495,11 +503,14 @@ function savingsPage() {
       <div><b>${eur(a.income - a.spent)}</b><small>avanzo medio al mese</small></div></div>
 
     <h2>I tuoi obiettivi</h2>
-    ${!emergency && a.needs ? `<div class="goal suggest"><span class="row-emoji">🛟</span><div class="goal-body"><b>Fondo emergenza consigliato</b>
+    ${!emergency && a.needs >= 100 && !a.current ? `<div class="goal suggest"><span class="row-emoji">🛟</span><div class="goal-body"><b>Fondo emergenza consigliato</b>
       <small>Circa ${eur(a.needs * 3)}–${eur(a.needs * 6)}: da 3 a 6 mesi delle tue spese necessarie (${eur(a.needs)} al mese). Serve per imprevisti come una riparazione o un periodo senza entrate.</small>
       <button class="secondary" data-newemergency>Crealo</button></div></div>` : ''}
-    ${goals.map(goalCard).join('') || '<p class="note">Ancora nessun obiettivo: crea il primo (vacanze, auto, fondo emergenza…).</p>'}
-    <button class="primary" data-newgoal>+ Nuovo obiettivo</button>
+    ${goals.map(goalCard).join('') || '<p class="note">Ancora nessun salvadanaio: creane uno con un tocco qui sotto, come quelli della tua banca.</p>'}
+    ${GOAL_PRESETS.some(([, n]) => !goals.some(g => g.name.toLowerCase() === n.toLowerCase()))
+      ? `<div class="chips presets">${GOAL_PRESETS.filter(([, n]) => !goals.some(g => g.name.toLowerCase() === n.toLowerCase()))
+        .map(([e, n]) => `<button class="chip" data-preset="${esc(e)}|${esc(n)}">${e} ${esc(n)}</button>`).join('')}</div>` : ''}
+    <button class="primary" data-newgoal>+ Nuovo salvadanaio</button>
 
     <h2>Come usi le tue entrate</h2>
     ${a.income ? `<p class="note">Regola 50/30/20 sulla media ${a.current ? 'di questo mese' : `degli ultimi ${plural(a.months, 'mese', 'mesi')}`} (entrate ${eur(a.income)} al mese).</p>
@@ -538,7 +549,7 @@ function goalCard(g) {
 function tips(a, rate, emergency) {
   const out = [];
   if (!moves.length) return [['👋', 'Inizia a segnare spese ed entrate: dopo qualche settimana qui trovi consigli sui tuoi numeri.']];
-  if (!emergency && a.needs) out.push(['🛟', `Non hai ancora un <b>fondo emergenza</b>. Con le tue spese necessarie (${eur(a.needs)} al mese) l'obiettivo è tra ${eur(a.needs * 3)} e ${eur(a.needs * 6)}: è il primo salvadanaio da riempire.`]);
+  if (!emergency && a.needs >= 100 && !a.current) out.push(['🛟', `Non hai ancora un <b>fondo emergenza</b>. Con le tue spese necessarie (${eur(a.needs)} al mese) l'obiettivo è tra ${eur(a.needs * 3)} e ${eur(a.needs * 6)}: è il primo salvadanaio da riempire.`]);
   if (rate != null && a.income) {
     if (rate < 0) out.push(['⚠️', `In media spendi più di quanto entra (${eur(a.spent - a.income)} al mese in più). Parti dalle categorie più alte in "Dove vanno i soldi" e metti un budget.`]);
     else if (rate < 0.1) out.push(['📈', `Ti avanza il ${Math.round(rate * 100)}% delle entrate. Prova ad arrivare al 10%: sarebbero ${eur(a.income * 0.1)} al mese.`]);
@@ -570,13 +581,18 @@ function tips(a, rate, emergency) {
 }
 
 // Finestra di un obiettivo: dati, versamento automatico, metti da parte / preleva, storico.
+// Salvadanai già pronti (come quelli dell'app della banca): un tocco e si crea, poi si rinomina se serve.
+const GOAL_PRESETS = [['🚗', 'Auto'], ['🎓', 'Università'], ['🔮', 'Futuro'], ['🪙', 'Svuotatasche'], ['❤️', 'La mia ragazza'],
+  ['🏖️', 'Vacanze'], ['🏠', 'Casa'], ['🎁', 'Regali']];
+
 let gdraft = null;
-function goalEditor(id = null, emergency = false) {
+function goalEditor(id = null, emergency = false, preset = null) {
   const g = goals.find(x => x.id === id);
   const a = monthlyAverages();
   gdraft = g ? structuredClone(g) : emergency
     ? { id: null, name: 'Fondo emergenza', emoji: '🛟', target: Math.round(a.needs * 3 / 50) * 50 || null, deadline: null, emergency: true, auto: null }
-    : { id: null, name: '', emoji: '🐷', target: null, deadline: null, emergency: false, auto: null };
+    : { id: null, name: preset?.[1] ?? '', emoji: preset?.[0] ?? '🐷', target: null, deadline: null, emergency: false, auto: null,
+      roundUp: preset?.[1] === 'Svuotatasche' && !goals.some(x => x.roundUp) };
   renderGoalEditor();
   if (!sheet.open) sheet.showModal();
 }
@@ -585,20 +601,27 @@ function renderGoalEditor() {
   const g = gdraft;
   const saved = g.id ? goalSaved(g) : 0;
   const hist = deposits.filter(d => d.goalId === g.id).sort((x, y) => y.date.localeCompare(x.date) || y.id - x.id);
-  sheet.innerHTML = `<div class="sheet-head"><div><h2>${g.id ? `${g.emoji} ${esc(g.name)}` : 'Nuovo obiettivo'}</h2>${g.id ? `<small>${eur(saved)} messi da parte</small>` : ''}</div>
+  const otherRound = goals.find(x => x.roundUp && x.id !== g.id);
+  sheet.innerHTML = `<div class="sheet-head"><div><h2>${g.id ? `${g.emoji} ${esc(g.name)}` : 'Nuovo salvadanaio'}</h2>${g.id ? `<small>${eur(saved)} messi da parte</small>` : ''}</div>
       <button class="icon" data-close aria-label="Chiudi">✕</button></div>
     ${g.id ? `<div class="deposit"><input id="depAmount" inputmode="decimal" placeholder="Importo €">
-      <button class="primary" data-deposit="1">Metti da parte</button><button class="secondary" data-deposit="-1">Preleva</button></div>` : ''}
+      <button class="primary" data-deposit="1">Metti da parte</button><button class="secondary" data-deposit="-1">Preleva</button></div>
+      <div class="align"><input id="bankBalance" inputmode="decimal" placeholder="Saldo nella banca €"><button class="secondary" data-align>Allinea al saldo della banca</button></div>` : ''}
     <div class="cat-row"><input id="gEmoji" class="emoji-in" value="${esc(g.emoji)}" aria-label="Emoji"><input id="gName" value="${esc(g.name)}" placeholder="Nome (es. Vacanze, Auto nuova)" autocomplete="off"></div>
-    <label class="field"><span>Obiettivo (€)</span><input id="gTarget" inputmode="decimal" value="${g.target ?? ''}" placeholder="es. 1500"></label>
+    ${g.id ? '' : '<label class="field"><span>Quanto c\'è già (€)</span><input id="gStart" inputmode="decimal" placeholder="il saldo attuale nella banca"></label>'}
+    <label class="field"><span>Obiettivo (€)</span><input id="gTarget" inputmode="decimal" value="${g.target ?? ''}" placeholder="facoltativo, es. 1500"></label>
     <label class="field"><span>Entro il</span><input type="date" id="gDeadline" value="${g.deadline ?? ''}"></label>
+    <label class="check"><input type="checkbox" id="gRound" ${g.roundUp ? 'checked' : ''} ${otherRound ? 'disabled' : ''}>
+      Svuotatasche: arrotonda all'euro ogni spesa che segni e metti qui la differenza</label>
+    ${otherRound ? `<p class="note">L'arrotondamento è già attivo su ${esc(otherRound.emoji)} ${esc(otherRound.name)}.</p>`
+      : '<p class="note">Es. spesa di 12,40 € → 0,60 € qui. È una stima di quello che fa la banca con la carta: ogni tanto allinea il saldo.</p>'}
     ${g.emergency ? '<p class="note">Consiglio: tra 3 e 6 mesi delle tue spese necessarie. Tienilo dove puoi prenderlo subito, non per spese programmate.</p>' : ''}
     <h3>Versamento automatico</h3>
     <div class="auto-row"><input id="gAuto" inputmode="decimal" value="${g.auto?.amount ?? ''}" placeholder="€ al mese"><span>il giorno</span>
       <input id="gDay" inputmode="numeric" value="${g.auto?.day ?? +today().slice(8, 10)}" aria-label="Giorno del mese"><span>del mese</span></div>
     <p class="note">Ogni mese quella cifra va da sola nell'obiettivo (ricordati di spostarla davvero sul conto dei risparmi).</p>
     <button class="primary" data-savegoal>Salva</button>
-    ${hist.length ? `<h3>Movimenti</h3>${hist.slice(0, 20).map(d => `<div class="row static"><span class="row-body"><b>${d.amount >= 0 ? 'Messi da parte' : 'Prelevati'}${d.auto ? ' (automatico)' : ''}</b><small>${shortDate(d.date)}</small></span>
+    ${hist.length ? `<h3>Movimenti</h3>${hist.slice(0, 20).map(d => `<div class="row static"><span class="row-body"><b>${d.note ?? (d.amount >= 0 ? 'Messi da parte' : 'Prelevati')}${d.auto ? ' (automatico)' : ''}</b><small>${shortDate(d.date)}</small></span>
       <b class="${d.amount >= 0 ? 'plus' : 'minus'}">${d.amount >= 0 ? '+' : '−'}${eur(Math.abs(d.amount))}</b><button class="icon small" data-deldep="${d.id}" aria-label="Elimina">✕</button></div>`).join('')}` : ''}
     ${g.id ? '<button class="link danger" data-delgoal>Elimina l\'obiettivo</button>' : ''}`;
 }
@@ -609,6 +632,8 @@ function readGoal() {
   g.emoji = $('#gEmoji').value.trim() || '🐷';
   g.target = parseFloat($('#gTarget').value.replace(',', '.')) || null;
   g.deadline = $('#gDeadline').value || null;
+  g.roundUp = $('#gRound').checked;
+  g.start = parseFloat(($('#gStart')?.value ?? '').replace(',', '.')) || null;
   const auto = parseFloat($('#gAuto').value.replace(',', '.')) || null;
   const day = Math.min(31, Math.max(1, parseInt($('#gDay').value, 10) || 1));
   if (!auto) g.auto = null;
@@ -624,7 +649,13 @@ async function saveGoal() {
   readGoal();
   const g = gdraft;
   if (!g.name) return toast('Scrivi il nome dell\'obiettivo.');
-  if (!g.id) { g.id = Date.now(); goals.push(g); } else goals = goals.map(x => (x.id === g.id ? g : x));
+  const { start, ...data } = g;
+  if (!data.id) {
+    data.id = Date.now();
+    goals.push(data);
+    // Il saldo che c'è già nella banca entra come primo movimento.
+    if (start) { deposits.push({ id: Date.now() + 1, goalId: data.id, date: today(), amount: start, auto: false, adjust: true, note: 'Saldo iniziale' }); await saveDeposits(); }
+  } else goals = goals.map(x => (x.id === data.id ? data : x));
   await saveGoals();
   const created = await applyAutoSave();
   sheet.close();
@@ -842,6 +873,21 @@ document.addEventListener('click', async e => {
   // Risparmi
   if (t.closest('[data-newgoal]')) return goalEditor();
   if (t.closest('[data-newemergency]')) return goalEditor(null, true);
+  const preset = t.closest('[data-preset]');
+  if (preset) return goalEditor(null, false, preset.dataset.preset.split('|'));
+  if (t.closest('[data-align]') && gdraft?.id) {
+    // Il saldo vero è quello della banca: la differenza diventa un movimento "Allineamento".
+    const bank = parseFloat($('#bankBalance').value.replace(',', '.'));
+    if (!(bank >= 0)) return toast('Scrivi il saldo che vedi nella banca.');
+    const diff = Math.round((bank - goalSaved(gdraft)) * 100) / 100;
+    if (!diff) return toast('È già allineato.');
+    deposits.push({ id: Date.now(), goalId: gdraft.id, date: today(), amount: diff, auto: false, adjust: true, note: 'Allineamento con la banca' });
+    await saveDeposits();
+    toast(`Allineato: ${eur(bank)} (${diff > 0 ? '+' : '−'}${eur(Math.abs(diff))})`);
+    renderGoalEditor();
+    route();
+    return;
+  }
   const goal = t.closest('[data-goal]');
   if (goal) return goalEditor(+goal.dataset.goal);
   if (t.closest('[data-savegoal]')) return saveGoal();
