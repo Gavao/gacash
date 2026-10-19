@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Backup automatico di Android (Google Drive) per Android 12 e successivi: tutti i dati dell'app,
+     compreso il database della WebView con spese, entrate e scontrini. Si esclude solo la cache, che si riscarica. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="root" path="." />
+        <include domain="sharedpref" path="." />
+        <include domain="database" path="." />
+        <include domain="file" path="." />
+        <exclude domain="root" path="cache" />
+        <exclude domain="root" path="app_webview/Default/Service Worker/CacheStorage" />
+        <exclude domain="root" path="app_webview/Default/HTTP Cache" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="root" path="." />
+        <include domain="sharedpref" path="." />
+        <include domain="database" path="." />
+        <include domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>

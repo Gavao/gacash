@@ -1,0 +1,14 @@
+# Prodotti della build Android
+android/build/
+dist/
+
+# Chiave di firma dell'APK e relativa password: restano solo su questo PC
+android/*.keystore
+android/keystore.properties
+
+# Impostazioni locali degli editor
+.claude/
+.vs/
+
+# Schede vere con dati personali: restano solo su questo PC (il repository è pubblico)
+esempi/

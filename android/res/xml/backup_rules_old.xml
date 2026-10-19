@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Backup automatico di Android (Google Drive) fino ad Android 11: stesse regole di backup_rules.xml. -->
+<full-backup-content>
+    <include domain="root" path="." />
+    <include domain="sharedpref" path="." />
+    <include domain="database" path="." />
+    <include domain="file" path="." />
+    <exclude domain="root" path="cache" />
+    <exclude domain="root" path="app_webview/Default/Service Worker/CacheStorage" />
+    <exclude domain="root" path="app_webview/Default/HTTP Cache" />
+</full-backup-content>
