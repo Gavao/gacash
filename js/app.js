@@ -116,6 +116,7 @@ function monthPage() {
       <button class="icon" data-month="1" aria-label="Mese successivo" ${isCurrent ? 'disabled' : ''}>›</button></div>
     <div class="balance ${balance < 0 ? 'neg' : ''}"><small>Saldo del mese</small><b>${eur(balance)}</b>
       <div class="balance-row"><span><i class="dot out"></i>Spese <b>${eur(spent)}</b></span><span><i class="dot in"></i>Entrate <b>${eur(earned)}</b></span></div>
+      ${savedInMonth(month) ? `<small class="forecast">🐷 Messi da parte <b>${eur(savedInMonth(month))}</b> · resta libero <b>${eur(balance - savedInMonth(month))}</b></small>` : ''}
       ${forecast != null && spent ? `<small class="forecast">Di questo passo a fine mese avrai speso circa <b>${eur(forecast)}</b></small>` : ''}</div>
     ${monthBudget ? budgetRow({ name: 'Budget del mese', emoji: '🎯' }, spent, monthBudget) : ''}
     ${budgets.length ? `<h2>Budget</h2>${budgets.map(({ c, used }) => budgetRow(c, used, c.budget)).join('')}` : ''}
@@ -413,14 +414,235 @@ function statsPage() {
 }
 
 // ---------------------------------------------------------------------------
+// Risparmi: obiettivi (salvadanai) con versamento automatico, fondo emergenza, regola 50/30/20 e
+// consigli calcolati sui tuoi numeri. Sono consigli generali di gestione del budget, non consulenza
+// finanziaria: l'app non suggerisce investimenti.
+// Obiettivo: { id, name, emoji, target, deadline, emergency, auto: { amount, day, next } | null }
+// Versamento: { id, goalId, date, amount (negativo = prelievo), auto }
+// ---------------------------------------------------------------------------
+let goals = [];
+let deposits = [];
+const saveGoals = () => setSetting('goals', goals);
+const saveDeposits = () => setSetting('deposits', deposits);
+const goalSaved = g => deposits.filter(d => d.goalId === g.id).reduce((a, d) => a + d.amount, 0);
+const savedInMonth = ym => deposits.filter(d => d.date.startsWith(ym)).reduce((a, d) => a + d.amount, 0);
+
+// Necessità (la parte "50" della regola): le altre spese contano come desideri. Si cambia in Categorie.
+const NEED_IDS = new Set(['spesa', 'casa', 'bollette', 'auto', 'trasporti', 'salute', 'animali']);
+const isNeed = c => c.need ?? NEED_IDS.has(c.id);
+
+/** Medie mensili degli ultimi 3 mesi completi con dati (o del mese in corso se non ce ne sono). */
+function monthlyAverages() {
+  const months = [1, 2, 3].map(n => addMonths(today().slice(0, 7) + '-15', -n).slice(0, 7)).filter(k => inMonth(k).length);
+  const keys = months.length ? months : [today().slice(0, 7)];
+  const ms = keys.flatMap(k => inMonth(k));
+  const per = list => sum(list) / keys.length;
+  const out = ms.filter(m => m.type === 'out');
+  return {
+    months: keys.length, current: !months.length,
+    income: per(ms.filter(m => m.type === 'in')),
+    spent: per(out),
+    needs: per(out.filter(m => isNeed(catOf(m.cat)))),
+    wants: per(out.filter(m => !isNeed(catOf(m.cat)))),
+    byCat: id => per(out.filter(m => m.cat === id)),
+    saved: keys.reduce((a, k) => a + savedInMonth(k), 0) / keys.length,
+  };
+}
+
+// Versamenti automatici: come le spese fisse, arrivano da soli alla data (anche quelli arretrati).
+async function applyAutoSave() {
+  let created = 0;
+  for (const g of goals) {
+    if (!g.auto?.amount) continue;
+    while (g.auto.next <= today()) {
+      deposits.push({ id: Date.now() + created, goalId: g.id, date: g.auto.next, amount: g.auto.amount, auto: true });
+      created++;
+      g.auto.next = addMonths(g.auto.next, 1, g.auto.day);
+    }
+  }
+  if (created) await Promise.all([saveGoals(), saveDeposits()]);
+  return created;
+}
+
+/** Quanto mettere da parte ogni mese per arrivare all'obiettivo entro la scadenza. */
+function monthlyNeeded(g) {
+  if (!g.deadline || !g.target) return null;
+  const left = g.target - goalSaved(g);
+  if (left <= 0) return 0;
+  const d = new Date(g.deadline + 'T12:00:00'), now = new Date();
+  const months = Math.max(1, (d.getFullYear() - now.getFullYear()) * 12 + d.getMonth() - now.getMonth());
+  return left / months;
+}
+
+function savingsPage() {
+  const a = monthlyAverages();
+  const total = goals.reduce((s, g) => s + goalSaved(g), 0);
+  const rate = a.income ? (a.income - a.spent) / a.income : null;
+  const emergency = goals.find(g => g.emergency);
+  const pct = v => (a.income ? Math.round((v / a.income) * 100) : 0);
+  const ruleRow = (label, value, target, hint) => {
+    const p = pct(value);
+    const over = label === 'Risparmio' ? p < target : p > target;
+    return `<div class="rule"><div class="rule-head"><b>${label}</b><span><b class="${over ? 'bad' : 'good'}">${p}%</b> · obiettivo ${label === 'Risparmio' ? 'almeno ' : 'massimo '}${target}%</span></div>
+      <div class="rule-bar"><i style="width:${Math.min(100, Math.max(0, p))}%"></i><em style="left:${target}%"></em></div>
+      <small>${eur(value)} al mese · ${hint}</small></div>`;
+  };
+  view.innerHTML = `<header class="top"><h1>Risparmi</h1></header>
+    <div class="kpis">
+      <div><b>${eur(total)}</b><small>messi da parte in tutto</small></div>
+      <div><b>${eur(savedInMonth(today().slice(0, 7)))}</b><small>questo mese</small></div>
+      <div><b class="${rate != null && rate < 0 ? 'minus' : ''}">${rate == null ? '—' : Math.round(rate * 100) + '%'}</b><small>delle entrate che ti avanza (media)</small></div>
+      <div><b>${eur(a.income - a.spent)}</b><small>avanzo medio al mese</small></div></div>
+
+    <h2>I tuoi obiettivi</h2>
+    ${!emergency && a.needs ? `<div class="goal suggest"><span class="row-emoji">🛟</span><div class="goal-body"><b>Fondo emergenza consigliato</b>
+      <small>Circa ${eur(a.needs * 3)}–${eur(a.needs * 6)}: da 3 a 6 mesi delle tue spese necessarie (${eur(a.needs)} al mese). Serve per imprevisti come una riparazione o un periodo senza entrate.</small>
+      <button class="secondary" data-newemergency>Crealo</button></div></div>` : ''}
+    ${goals.map(goalCard).join('') || '<p class="note">Ancora nessun obiettivo: crea il primo (vacanze, auto, fondo emergenza…).</p>'}
+    <button class="primary" data-newgoal>+ Nuovo obiettivo</button>
+
+    <h2>Come usi le tue entrate</h2>
+    ${a.income ? `<p class="note">Regola 50/30/20 sulla media ${a.current ? 'di questo mese' : `degli ultimi ${plural(a.months, 'mese', 'mesi')}`} (entrate ${eur(a.income)} al mese).</p>
+      ${ruleRow('Necessità', a.needs, 50, 'casa, bollette, spesa, trasporti, salute')}
+      ${ruleRow('Desideri', a.wants, 30, 'ristoranti, svago, shopping, abbonamenti, viaggi')}
+      ${ruleRow('Risparmio', Math.max(0, a.income - a.spent), 20, 'quello che ti avanza a fine mese')}
+      <p class="note">Quali spese sono "necessità" lo decidi tu in Altro → Categorie e budget.</p>`
+      : '<p class="note">Segna le tue entrate (es. lo stipendio tra le spese fisse) per vedere come le usi.</p>'}
+
+    <h2>Consigli per te</h2>
+    <div class="tips">${tips(a, rate, emergency).map(t => `<div class="tip"><span>${t[0]}</span><p>${t[1]}</p></div>`).join('')}</div>
+    <details class="box"><summary>Regole d'oro per risparmiare</summary><ul>
+      <li><b>Paga prima te stesso:</b> metti da parte appena arriva lo stipendio (con il versamento automatico), non quello che avanza a fine mese.</li>
+      <li><b>Prima il fondo emergenza</b>, poi gli altri obiettivi: evita di dover usare carte o prestiti per un imprevisto.</li>
+      <li><b>Un conto separato</b> per i risparmi aiuta a non spenderli per sbaglio.</li>
+      <li><b>Regola delle 24 ore:</b> per un acquisto non necessario aspetta un giorno; spesso la voglia passa.</li>
+      <li><b>Rivedi le spese fisse una volta l'anno:</b> bollette, telefono, assicurazioni, abbonamenti. Spesso c'è un'offerta migliore o qualcosa che non usi.</li>
+      <li><b>Obiettivi concreti</b> (cifra e data) funzionano meglio di "risparmiare di più".</li>
+      <li><b>Piccole spese ricorrenti</b> (caffè, delivery, app) pesano più di quanto sembra: guarda "Dove vanno i soldi".</li>
+    </ul></details>
+    <p class="note disclaimer">Sono indicazioni generali per organizzare il budget, calcolate sui dati che inserisci. Non sono consulenza finanziaria: per investire i risparmi rivolgiti a un consulente abilitato.</p>`;
+}
+
+function goalCard(g) {
+  const saved = goalSaved(g);
+  const p = g.target ? Math.min(1, saved / g.target) : 0;
+  const need = monthlyNeeded(g);
+  return `<button class="goal" data-goal="${g.id}"><span class="row-emoji">${g.emoji}</span><div class="goal-body">
+    <div class="goal-head"><b>${esc(g.name)}</b><span><b>${eur(saved)}</b>${g.target ? ` di ${eur(g.target)}` : ''}</span></div>
+    ${g.target ? `<div class="budget-bar goal-bar"><i style="width:${p * 100}%"></i></div>` : ''}
+    <small>${p >= 1 ? '🎉 Obiettivo raggiunto!' : need != null ? `Per arrivarci entro ${shortDate(g.deadline)}: ${eur(need)} al mese` : g.target ? `Mancano ${eur(g.target - saved)}` : ''}
+      ${g.auto?.amount ? ` · automatico ${eur(g.auto.amount)} il ${g.auto.day} del mese` : ''}</small></div></button>`;
+}
+
+/** Consigli calcolati sui tuoi numeri (solo gestione del budget, niente investimenti). */
+function tips(a, rate, emergency) {
+  const out = [];
+  if (!moves.length) return [['👋', 'Inizia a segnare spese ed entrate: dopo qualche settimana qui trovi consigli sui tuoi numeri.']];
+  if (!emergency && a.needs) out.push(['🛟', `Non hai ancora un <b>fondo emergenza</b>. Con le tue spese necessarie (${eur(a.needs)} al mese) l'obiettivo è tra ${eur(a.needs * 3)} e ${eur(a.needs * 6)}: è il primo salvadanaio da riempire.`]);
+  if (rate != null && a.income) {
+    if (rate < 0) out.push(['⚠️', `In media spendi più di quanto entra (${eur(a.spent - a.income)} al mese in più). Parti dalle categorie più alte in "Dove vanno i soldi" e metti un budget.`]);
+    else if (rate < 0.1) out.push(['📈', `Ti avanza il ${Math.round(rate * 100)}% delle entrate. Prova ad arrivare al 10%: sarebbero ${eur(a.income * 0.1)} al mese.`]);
+    else if (rate >= 0.2) out.push(['🏆', `Ti avanza il ${Math.round(rate * 100)}% delle entrate: ottimo! Assicurati che finisca davvero in un obiettivo (con il versamento automatico), così non si disperde.`]);
+  }
+  if (a.income && a.needs / a.income > 0.5) out.push(['🏠', `Le spese necessarie sono il ${Math.round((a.needs / a.income) * 100)}% delle entrate (consigliato fino al 50%). Bollette, telefono e assicurazioni sono le prime da confrontare con altre offerte.`]);
+  if (a.income && a.wants / a.income > 0.3) {
+    const top = cats.filter(c => c.type === 'out' && !isNeed(c)).map(c => [c, a.byCat(c.id)]).sort((x, y) => y[1] - x[1]).slice(0, 2).filter(([, v]) => v > 0);
+    out.push(['🎯', `I desideri sono il ${Math.round((a.wants / a.income) * 100)}% delle entrate (consigliato fino al 30%). Le voci più alte: ${top.map(([c, v]) => `${c.emoji} ${esc(c.name)} ${eur(v)} al mese`).join(', ')}. Un budget su queste fa la differenza.`]);
+  }
+  const subs = fixed.filter(f => f.active && f.type === 'out' && f.cat === 'abbonamenti');
+  if (subs.length >= 2) {
+    const m = subs.reduce((s, f) => s + f.amount / f.every, 0);
+    out.push(['📺', `Paghi ${subs.length} abbonamenti per ${eur(m)} al mese (${eur(m * 12)} all'anno): controlla quali usi davvero.`]);
+  }
+  // Categoria che questo mese sta andando molto sopra la sua media.
+  const ym = today().slice(0, 7);
+  const day = +today().slice(8, 10);
+  if (day >= 10 && !a.current) {
+    for (const c of cats.filter(x => x.type === 'out')) {
+      const avg = a.byCat(c.id), now = sum(inMonth(ym).filter(m => m.type === 'out' && m.cat === c.id));
+      if (avg > 30 && now > avg * 1.3) { out.push(['🔺', `${c.emoji} ${esc(c.name)}: questo mese sei già a ${eur(now)}, sopra la tua media di ${eur(avg)}.`]); break; }
+    }
+  }
+  const salary = fixed.find(f => f.active && f.type === 'in');
+  if (salary && !goals.some(g => g.auto?.amount)) out.push(['⚡', `Lo stipendio arriva il ${salary.day} del mese: imposta un versamento automatico in un obiettivo per quel giorno. Mettere da parte subito è il modo più semplice di risparmiare.`]);
+  if (!out.length) out.push(['✅', 'I tuoi numeri sono in ordine: continua così e controlla qui ogni tanto.']);
+  return out;
+}
+
+// Finestra di un obiettivo: dati, versamento automatico, metti da parte / preleva, storico.
+let gdraft = null;
+function goalEditor(id = null, emergency = false) {
+  const g = goals.find(x => x.id === id);
+  const a = monthlyAverages();
+  gdraft = g ? structuredClone(g) : emergency
+    ? { id: null, name: 'Fondo emergenza', emoji: '🛟', target: Math.round(a.needs * 3 / 50) * 50 || null, deadline: null, emergency: true, auto: null }
+    : { id: null, name: '', emoji: '🐷', target: null, deadline: null, emergency: false, auto: null };
+  renderGoalEditor();
+  if (!sheet.open) sheet.showModal();
+}
+
+function renderGoalEditor() {
+  const g = gdraft;
+  const saved = g.id ? goalSaved(g) : 0;
+  const hist = deposits.filter(d => d.goalId === g.id).sort((x, y) => y.date.localeCompare(x.date) || y.id - x.id);
+  sheet.innerHTML = `<div class="sheet-head"><div><h2>${g.id ? `${g.emoji} ${esc(g.name)}` : 'Nuovo obiettivo'}</h2>${g.id ? `<small>${eur(saved)} messi da parte</small>` : ''}</div>
+      <button class="icon" data-close aria-label="Chiudi">✕</button></div>
+    ${g.id ? `<div class="deposit"><input id="depAmount" inputmode="decimal" placeholder="Importo €">
+      <button class="primary" data-deposit="1">Metti da parte</button><button class="secondary" data-deposit="-1">Preleva</button></div>` : ''}
+    <div class="cat-row"><input id="gEmoji" class="emoji-in" value="${esc(g.emoji)}" aria-label="Emoji"><input id="gName" value="${esc(g.name)}" placeholder="Nome (es. Vacanze, Auto nuova)" autocomplete="off"></div>
+    <label class="field"><span>Obiettivo (€)</span><input id="gTarget" inputmode="decimal" value="${g.target ?? ''}" placeholder="es. 1500"></label>
+    <label class="field"><span>Entro il</span><input type="date" id="gDeadline" value="${g.deadline ?? ''}"></label>
+    ${g.emergency ? '<p class="note">Consiglio: tra 3 e 6 mesi delle tue spese necessarie. Tienilo dove puoi prenderlo subito, non per spese programmate.</p>' : ''}
+    <h3>Versamento automatico</h3>
+    <div class="auto-row"><input id="gAuto" inputmode="decimal" value="${g.auto?.amount ?? ''}" placeholder="€ al mese"><span>il giorno</span>
+      <input id="gDay" inputmode="numeric" value="${g.auto?.day ?? +today().slice(8, 10)}" aria-label="Giorno del mese"><span>del mese</span></div>
+    <p class="note">Ogni mese quella cifra va da sola nell'obiettivo (ricordati di spostarla davvero sul conto dei risparmi).</p>
+    <button class="primary" data-savegoal>Salva</button>
+    ${hist.length ? `<h3>Movimenti</h3>${hist.slice(0, 20).map(d => `<div class="row static"><span class="row-body"><b>${d.amount >= 0 ? 'Messi da parte' : 'Prelevati'}${d.auto ? ' (automatico)' : ''}</b><small>${shortDate(d.date)}</small></span>
+      <b class="${d.amount >= 0 ? 'plus' : 'minus'}">${d.amount >= 0 ? '+' : '−'}${eur(Math.abs(d.amount))}</b><button class="icon small" data-deldep="${d.id}" aria-label="Elimina">✕</button></div>`).join('')}` : ''}
+    ${g.id ? '<button class="link danger" data-delgoal>Elimina l\'obiettivo</button>' : ''}`;
+}
+
+function readGoal() {
+  const g = gdraft;
+  g.name = $('#gName').value.trim();
+  g.emoji = $('#gEmoji').value.trim() || '🐷';
+  g.target = parseFloat($('#gTarget').value.replace(',', '.')) || null;
+  g.deadline = $('#gDeadline').value || null;
+  const auto = parseFloat($('#gAuto').value.replace(',', '.')) || null;
+  const day = Math.min(31, Math.max(1, parseInt($('#gDay').value, 10) || 1));
+  if (!auto) g.auto = null;
+  else {
+    // Prima data: quel giorno di questo mese se non è già passato, altrimenti del mese prossimo.
+    const thisMonth = addMonths(today().slice(0, 7) + '-01', 0, day);
+    const next = g.auto && g.auto.day === day ? g.auto.next : thisMonth >= today() ? thisMonth : addMonths(thisMonth, 1, day);
+    g.auto = { amount: auto, day, next };
+  }
+}
+
+async function saveGoal() {
+  readGoal();
+  const g = gdraft;
+  if (!g.name) return toast('Scrivi il nome dell\'obiettivo.');
+  if (!g.id) { g.id = Date.now(); goals.push(g); } else goals = goals.map(x => (x.id === g.id ? g : x));
+  await saveGoals();
+  const created = await applyAutoSave();
+  sheet.close();
+  toast(`Obiettivo salvato${g.auto ? ` · automatico ${eur(g.auto.amount)} dal ${shortDate(g.auto.next)}` : ''}${created ? ' (versamento di oggi fatto)' : ''}`);
+  route();
+}
+
+// ---------------------------------------------------------------------------
 // Categorie e budget
 // ---------------------------------------------------------------------------
 function catsPage() {
   const row = c => `<div class="cat-row"><span class="row-emoji">${c.emoji}</span><input data-catname="${c.id}" value="${esc(c.name)}" aria-label="Nome">
-    ${c.type === 'out' ? `<input data-catbudget="${c.id}" inputmode="decimal" value="${c.budget ?? ''}" placeholder="budget €" aria-label="Budget al mese">` : ''}
+    ${c.type === 'out' ? `<input data-catbudget="${c.id}" inputmode="decimal" value="${c.budget ?? ''}" placeholder="budget €" aria-label="Budget al mese">
+      <label class="need" title="Spesa necessaria"><input type="checkbox" data-catneed="${c.id}" ${isNeed(c) ? 'checked' : ''}>nec.</label>` : ''}
     ${moves.some(m => m.cat === c.id) || fixed.some(f => f.cat === c.id) ? '' : `<button class="icon small" data-delcat="${c.id}" aria-label="Elimina">✕</button>`}</div>`;
   view.innerHTML = `<header class="top"><a class="back" href="#/altro" aria-label="Indietro">‹</a><h1>Categorie e budget</h1></header>
-    <p class="note">Il budget è quanto vuoi spendere al massimo ogni mese per quella categoria: lascia vuoto se non ti serve.</p>
+    <p class="note">Il budget è quanto vuoi spendere al massimo ogni mese per quella categoria: lascia vuoto se non ti serve.
+      "nec." = spesa necessaria (casa, bollette, spesa…): serve per la regola 50/30/20 nei Risparmi.</p>
     <label class="field"><span>🎯 Budget totale del mese</span><input id="monthBudget" inputmode="decimal" value="${monthBudget ?? ''}" placeholder="facoltativo"></label>
     <h2>Spese</h2>${cats.filter(c => c.type === 'out').map(row).join('')}
     <h2>Entrate</h2>${cats.filter(c => c.type === 'in').map(row).join('')}
@@ -436,6 +658,7 @@ function catsPage() {
 function morePage() {
   view.innerHTML = `<header class="top"><h1>Altro</h1></header>
     <div class="list">
+      <a class="row" href="#/fisse"><span class="row-emoji">🔁</span><span class="row-body"><b>Spese fisse e abbonamenti</b><small>${plural(fixed.filter(f => f.active).length, 'attiva', 'attive')} · si registrano da sole</small></span><span class="chev">›</span></a>
       <a class="row" href="#/statistiche"><span class="row-emoji">📊</span><span class="row-body"><b>Statistiche</b><small>12 mesi, media mensile, risparmio, categorie dell'anno</small></span><span class="chev">›</span></a>
       <a class="row" href="#/garanzie"><span class="row-emoji">🛡️</span><span class="row-body"><b>Garanzie e scontrini</b><small>${plural(moves.filter(m => m.garanzia && warrantyEnd(m) >= today()).length, 'acquisto', 'acquisti')} in garanzia</small></span><span class="chev">›</span></a>
       <a class="row" href="#/categorie"><span class="row-emoji">🏷️</span><span class="row-body"><b>Categorie e budget</b><small>nomi, nuove categorie e tetti di spesa</small></span><span class="chev">›</span></a>
@@ -456,7 +679,7 @@ function morePage() {
 
 async function backupJson() {
   const photos = await db.all('photos');
-  return JSON.stringify({ app: 'gacash', version: 1, date: today(), moves, cats, fixed, monthBudget, photos });
+  return JSON.stringify({ app: 'gacash', version: 1, date: today(), moves, cats, fixed, monthBudget, goals, deposits, photos });
 }
 
 async function shareFile(name, mime, text) {
@@ -500,6 +723,9 @@ async function restoreBackup(file) {
     cats = data.cats ?? cats;
     fixed = data.fixed ?? [];
     monthBudget = data.monthBudget ?? null;
+    goals = data.goals ?? [];
+    deposits = data.deposits ?? [];
+    await Promise.all([saveGoals(), saveDeposits()]);
     sortMoves();
     await Promise.all([saveCats(), saveFixed(), setSetting('monthBudget', monthBudget)]);
     toast(`Ripristinati ${plural(moves.length, 'movimento', 'movimenti')}`);
@@ -613,6 +839,46 @@ document.addEventListener('click', async e => {
     return;
   }
 
+  // Risparmi
+  if (t.closest('[data-newgoal]')) return goalEditor();
+  if (t.closest('[data-newemergency]')) return goalEditor(null, true);
+  const goal = t.closest('[data-goal]');
+  if (goal) return goalEditor(+goal.dataset.goal);
+  if (t.closest('[data-savegoal]')) return saveGoal();
+  const dep = t.closest('[data-deposit]');
+  if (dep && gdraft?.id) {
+    const amount = parseFloat($('#depAmount').value.replace(',', '.'));
+    if (!(amount > 0)) return toast('Scrivi l\'importo.');
+    const sign = +dep.dataset.deposit;
+    if (sign < 0 && amount > goalSaved(gdraft)) return toast(`Nell'obiettivo ci sono solo ${eur(goalSaved(gdraft))}.`);
+    deposits.push({ id: Date.now(), goalId: gdraft.id, date: today(), amount: sign * amount, auto: false });
+    await saveDeposits();
+    const g = goals.find(x => x.id === gdraft.id);
+    toast(sign > 0 ? `🐷 ${eur(amount)} messi da parte per ${g.name}` : `Prelevati ${eur(amount)} da ${g.name}`);
+    if (sign > 0 && g.target && goalSaved(g) >= g.target) setTimeout(() => toast(`🎉 Obiettivo "${g.name}" raggiunto!`), 2900);
+    renderGoalEditor();
+    route();
+    return;
+  }
+  const delDep = t.closest('[data-deldep]');
+  if (delDep) {
+    if (!confirm('Eliminare questo movimento dell\'obiettivo?')) return;
+    deposits = deposits.filter(d => d.id !== +delDep.dataset.deldep);
+    await saveDeposits();
+    renderGoalEditor();
+    route();
+    return;
+  }
+  if (t.closest('[data-delgoal]') && gdraft) {
+    if (!confirm(`Eliminare l'obiettivo "${gdraft.name}" e i suoi movimenti?`)) return;
+    goals = goals.filter(g => g.id !== gdraft.id);
+    deposits = deposits.filter(d => d.goalId !== gdraft.id);
+    await Promise.all([saveGoals(), saveDeposits()]);
+    sheet.close();
+    route();
+    return;
+  }
+
   // Categorie
   if (t.closest('[data-addcat]')) {
     const name = $('#newCat').value.trim();
@@ -651,6 +917,7 @@ document.addEventListener('change', async e => {
   if (el.id === 'moveDate' && draft) { readEditor(); draft.date = el.value || today(); renderEditor(); return; }
   if (el.id === 'fEvery' && fdraft) { readFixed(); renderFixedEditor(); return; }
   if (el.dataset.catname) { const c = cats.find(x => x.id === el.dataset.catname); c.name = el.value.trim() || c.name; await saveCats(); return; }
+  if (el.dataset.catneed) { const c = cats.find(x => x.id === el.dataset.catneed); c.need = el.checked; await saveCats(); return; }
   if (el.dataset.catbudget) {
     const c = cats.find(x => x.id === el.dataset.catbudget);
     c.budget = parseFloat(el.value.replace(',', '.')) || null;
@@ -688,10 +955,11 @@ window.appBack = () => {
 // ---------------------------------------------------------------------------
 function route() {
   const page = location.hash.replace(/^#\/?/, '').split('/')[0];
-  const tab = { '': 'month', movimenti: 'moves', fisse: 'fixed', altro: 'more', garanzie: 'more', statistiche: 'more', categorie: 'more' }[page] ?? 'month';
+  const tab = { '': 'month', movimenti: 'moves', fisse: 'more', risparmi: 'savings', altro: 'more', garanzie: 'more', statistiche: 'more', categorie: 'more' }[page] ?? 'month';
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.tab === tab);
   if (page === 'movimenti') movesPage();
   else if (page === 'fisse') fixedPage();
+  else if (page === 'risparmi') savingsPage();
   else if (page === 'altro') morePage();
   else if (page === 'garanzie') warrantyPage();
   else if (page === 'statistiche') statsPage();
@@ -705,6 +973,7 @@ document.addEventListener('visibilitychange', async () => {
   checkWebUpdate();
   const before = moves.length;
   await applyFixed();   // a mezzanotte (o riaprendo l'app) arrivano le spese fisse del giorno
+  await applyAutoSave();
   if (moves.length !== before) route();
 });
 addEventListener('unhandledrejection', e => toast(e.reason?.message ?? 'Qualcosa non è andato'));
@@ -716,6 +985,9 @@ cats = await getSetting('cats', DEFAULT_CATS);
 fixed = await getSetting('fixed', []);
 monthBudget = await getSetting('monthBudget', null);
 lastBackup = await getSetting('lastBackup', null);
+goals = await getSetting('goals', []);
+deposits = await getSetting('deposits', []);
+await applyAutoSave();
 await applyFixed();
 route();
 navigator.storage?.persist?.().catch(() => {});
